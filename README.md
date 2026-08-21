@@ -30,11 +30,12 @@ The base unit of work. Subclass it (or one of the concrete types below) to defin
 Declare typed, required or optional data attributes on an instruction:
 
 ```python
-class CollectAddress(DataCollectionInstruction):
-    line1:    str = Field(required=True,  description="Street address")
-    city:     str = Field(required=True,  description="City")
-    zip_code: str = Field(required=True,  description="5-digit ZIP")
-    line2:    str = Field(required=False, description="Apt / suite")
+class CollectGuestDetails(DataCollectionInstruction):
+    full_name:    str = Field(required=True,  description="Guest full name")
+    check_in:     str = Field(required=True,  description="Check-in date (YYYY-MM-DD)")
+    check_out:    str = Field(required=True,  description="Check-out date (YYYY-MM-DD)")
+    room_type:    str = Field(required=True,  description="Room type: single, double, or suite")
+    dietary_needs: str = Field(required=False, description="Any dietary restrictions")
 ```
 
 The metaclass lifts these out of the class namespace so each instance gets its own mutable slot.
@@ -45,9 +46,9 @@ A flat, dotted-key dict shared across all instructions in a workflow. Instructio
 
 ```python
 ctx = Context()
-ctx["address.city"] = "Springfield"
-ctx.get("intent", "other")
-ctx.namespace("booking")["booking_id"] = "SVC-001"
+ctx["guest.full_name"] = "Aria Patel"
+ctx.get("request_type", "general")
+ctx.namespace("reservation")["confirmation_no"] = "HTL-4821"
 ctx.snapshot()    # plain dict — useful for templates
 ctx.as_nested()   # expand dots into nested dicts
 ```
@@ -68,22 +69,25 @@ Collects structured fields from a user over multiple turns. Driven by a 3-phase 
 from prompt_ml import DataCollectionInstruction, Field
 from prompt_ml.backend.openai_backend import OpenAIBackend
 
-class CollectAddress(DataCollectionInstruction):
-    context_namespace = "address"        # keys written as address.city, etc.
+class CollectGuestDetails(DataCollectionInstruction):
+    context_namespace = "guest"          # keys written as guest.full_name, etc.
     auto_confirm      = True             # default; set False to skip confirm step
-    system_context    = "You are a friendly phone assistant for Acme Auto."
+    system_context    = "You are a warm and professional hotel concierge at The Grand."
 
-    line1:    str = Field(required=True,  description="Street address line 1")
-    city:     str = Field(required=True,  description="City")
-    state:    str = Field(required=True,  description="State (two-letter code)")
-    zip_code: str = Field(required=True,  description="Five-digit ZIP code")
-    line2:    str = Field(required=False, description="Apartment or suite")
+    full_name:     str = Field(required=True,  description="Guest full name")
+    check_in:      str = Field(required=True,  description="Check-in date (YYYY-MM-DD)")
+    check_out:     str = Field(required=True,  description="Check-out date (YYYY-MM-DD)")
+    room_type:     str = Field(required=True,  description="Room type: single, double, or suite")
+    dietary_needs: str = Field(required=False, description="Dietary restrictions or preferences")
 
     def on_complete(self) -> str:
-        return f"Got it — {self.line1}, {self.city} {self.state} {self.zip_code}."
+        return (
+            f"Perfect, {self.full_name}! I have you down for a {self.room_type} "
+            f"from {self.check_in} to {self.check_out}."
+        )
 
-instr = CollectAddress(backend=OpenAIBackend(api_key="sk-..."), context=ctx)
-reply = instr.execute("742 Evergreen Terrace, Springfield IL 62701")
+instr = CollectGuestDetails(backend=OpenAIBackend(api_key="sk-..."), context=ctx)
+reply = instr.execute("Aria Patel, checking in March 3rd, out March 7th, need a suite please")
 ```
 
 **Key class variables**
@@ -103,14 +107,18 @@ Non-interactive — produces text without waiting for user input. Three modes (p
 
 ```python
 class Greeting(OutputInstruction):
-    text = "Thank you for calling Acme Auto."          # 1. static string
+    text = "Welcome to The Grand. How may I assist you today?"   # 1. static string
 
-class Confirmation(OutputInstruction):
-    template = "Booking {booking.booking_id} confirmed at {booking.location}."  # 2. context template
+class ReservationConfirmed(OutputInstruction):
+    template = (
+        "Your reservation is confirmed! "
+        "Confirmation number: {reservation.confirmation_no}. "
+        "We look forward to welcoming you on {guest.check_in}."
+    )                                                             # 2. context template
 
-class PersonalisedGreeting(OutputInstruction):
-    system_prompt = "Generate a warm greeting using caller name if available."  # 3. LLM-generated
-    backend = OpenAIBackend(api_key="sk-...")
+class PersonalisedWelcome(OutputInstruction):
+    system_prompt = "Write a warm one-sentence welcome using the guest name if available."
+    backend = OpenAIBackend(api_key="sk-...")                    # 3. LLM-generated
 ```
 
 `auto_advance = True` — a `Sequence` runs this without waiting for user input.
@@ -122,18 +130,20 @@ class PersonalisedGreeting(OutputInstruction):
 Maps a user message to one of a defined set of labels. Rule-based matching runs first (zero LLM cost); falls back to LLM for anything ambiguous. The result is written to `Context`.
 
 ```python
-class ClassifyIntent(ClassifyInstruction):
+class ClassifyRequest(ClassifyInstruction):
     labels = {
-        "service": "Schedule a service or repair",
-        "sales":   "Buy or enquire about a vehicle",
-        "other":   "Anything else",
+        "reservation": "Make or modify a room reservation",
+        "concierge":   "Restaurant, spa, or activity bookings",
+        "complaint":   "Report an issue or make a complaint",
+        "other":       "Anything else",
     }
     rules = {
-        "service": ["oil change", "brake", "repair", "r:tyre?s?"],  # prefix r: for regex
-        "sales":   ["buy", "purchase", "new car"],
+        "reservation": ["book", "reserve", "check in", "check-in", "room"],
+        "concierge":   ["restaurant", "spa", "tour", "taxi", "activity"],
+        "complaint":   ["complaint", "issue", "problem", "broken", "noise"],
     }
     default_label = "other"
-    output_key    = "intent"    # written to ctx["intent"]; default is "<ClassName>.label"
+    output_key    = "request_type"   # written to ctx["request_type"]
 ```
 
 `emit_output = False` — the label is returned by `execute()` but not surfaced to the user.
@@ -145,23 +155,29 @@ class ClassifyIntent(ClassifyInstruction):
 Wraps a Python callable as a side effect (API call, DB write, etc.). Reads inputs from `Context`, writes results back.
 
 ```python
-class BookService(ActionInstruction):
-    context_namespace = "booking"
+class CreateReservation(ActionInstruction):
+    context_namespace = "reservation"
     max_retries       = 1
 
     def run(self) -> ActionResult:
-        city = self.context.get("address.city")
+        name      = self.context.get("guest.full_name")
+        check_in  = self.context.get("guest.check_in")
+        check_out = self.context.get("guest.check_out")
+        room_type = self.context.get("guest.room_type")
         try:
-            result = booking_api.create(city=city)
+            res = hotel_api.create_reservation(
+                name=name, check_in=check_in,
+                check_out=check_out, room_type=room_type,
+            )
             return ActionResult.ok(
-                data={"booking_id": result.id},
-                message=f"Booked! Reference: {result.id}",
+                data={"confirmation_no": res.id, "room_number": res.room},
+                message=f"Reservation created. Confirmation: {res.id}.",
             )
         except ApiError as e:
-            return ActionResult.fail(message="Booking failed.", error=e)
+            return ActionResult.fail(message="Could not create reservation.", error=e)
 
     def on_failure(self, result: ActionResult) -> str:
-        return "Sorry, I couldn't complete the booking. Please call us directly."
+        return "I'm sorry, I wasn't able to complete your reservation. Please contact the front desk."
 ```
 
 `auto_advance = True` — runs automatically in a `Sequence` after the preceding step completes.
@@ -176,10 +192,10 @@ Runs steps in order. Auto-drains consecutive `auto_advance` steps without waitin
 
 ```python
 Sequence([
-    Greeting(),            # auto_advance → fires immediately
-    CollectAddress(...),   # interactive → waits for caller
-    BookService(...),      # auto_advance → fires when address complete
-    ServiceConfirmation(), # auto_advance → fires immediately after
+    Greeting(),              # auto_advance → fires immediately
+    CollectGuestDetails(..), # interactive → waits for guest input
+    CreateReservation(..),   # auto_advance → fires when details complete
+    ReservationConfirmed(),  # auto_advance → fires immediately after
 ])
 ```
 
@@ -189,11 +205,12 @@ Classifies user input and routes to the matching sub-flow. The original message 
 
 ```python
 Branch(
-    classifier=ClassifyIntent(context=ctx, backend=backend),
+    classifier=ClassifyRequest(context=ctx, backend=backend),
     routes={
-        "service": Sequence([CollectAddress(...), BookService(...), Farewell()]),
-        "sales":   SalesFarewell(),
-        "other":   GenericFarewell(),
+        "reservation": Sequence([CollectGuestDetails(..), CreateReservation(..), ReservationConfirmed()]),
+        "concierge":   Sequence([CollectConciergeRequest(..), BookAmenity(..)]),
+        "complaint":   LogComplaint(),
+        "other":       TransferToFrontDesk(),
     },
     default="other",
 )
@@ -205,8 +222,8 @@ Repeats a step until a condition is met or `max_iterations` is reached.
 
 ```python
 Loop(
-    step=CollectAppointment(context=ctx, backend=backend),
-    until=lambda ctx: ctx.get("booking.confirmed") is True,
+    step=CollectPaymentDetails(context=ctx, backend=backend),
+    until=lambda ctx: ctx.get("payment.verified") is True,
     max_iterations=3,
     context=ctx,
 )
@@ -217,26 +234,34 @@ Loop(
 Top-level orchestrator. Owns the `Context`, builds the workflow graph in `build()`, and exposes `start()` / `execute()` / `reset()`.
 
 ```python
-class DealershipFlow(Flow):
+class HotelConciergeFlow(Flow):
     def build(self, context, backend):
         return Sequence([
             Greeting(),
             Branch(
-                classifier=ClassifyIntent(context=context, backend=backend),
-                routes={"service": Sequence([...]), "sales": SalesFarewell()},
+                classifier=ClassifyRequest(context=context, backend=backend),
+                routes={
+                    "reservation": Sequence([
+                        CollectGuestDetails(context=context, backend=backend),
+                        CreateReservation(context=context),
+                        ReservationConfirmed(context=context),
+                    ]),
+                    "concierge": ConciergeHandler(context=context, backend=backend),
+                    "other":     TransferToFrontDesk(),
+                },
                 default="other",
             ),
         ])
 
-flow = DealershipFlow(backend=OpenAIBackend(api_key="sk-..."))
-print(flow.start())                 # fires auto-advance opening steps
+flow = HotelConciergeFlow(backend=OpenAIBackend(api_key="sk-..."))
+print(flow.start())                  # fires auto-advance opening steps
 
 while not flow.is_complete():
-    reply = flow.execute(input("Caller: "))
-    print("Agent:", reply)
+    reply = flow.execute(input("Guest: "))
+    print("Concierge:", reply)
 
-flow.context.snapshot()             # full collected data
-flow.history                        # list of {"user": ..., "agent": ...} dicts
+flow.context.snapshot()              # full collected data
+flow.history                         # list of {"user": ..., "agent": ...} dicts
 ```
 
 ---
@@ -265,10 +290,4 @@ Integration tests hit the real OpenAI API:
 ```bash
 export OPENAI_API_KEY=sk-...
 uv run python -m pytest tests/ -m integration -v
-```
-
-Run the mock dealership demo end-to-end:
-
-```bash
-uv run python examples/dealership/service_flow.py
 ```
